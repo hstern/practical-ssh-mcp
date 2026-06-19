@@ -53,7 +53,7 @@ Tier 0 — the *tier of a tool is set by what it must invoke on the remote*):
   outcomes are `allow` / `deny` / `confirm`, all journaled. Off unless configured.
 - **The connection is the unit of auth; `connection_id` is the referent for direct
   operations.** Every one-shot tool that moves bytes takes a `connection_id` (or a
-  handle — `session_id`, `output_ref`, `schema_ref`, `repo_ref`, a forward `id` —
+  handle — `session_id`, `channel_id`, `output_ref`, `schema_ref`, `repo_ref` —
   created against one); it **never re-authenticates**. **`host` (a profile) appears
   only where the operation is connection-*independent*:** `connection.open` itself (profile +
   `credential_ref` → connection), `host.plan` (never connects), and the long-lived
@@ -61,7 +61,9 @@ Tier 0 — the *tier of a tool is set by what it must invoke on the remote*):
   `endpoint.watch`, `systemd.watch`, `systemd.journal`) — these target a profile so
   the engine reconnects and they survive disconnection.
 - **`host`** (where it appears) is a configured host profile (preferred) or an
-  ad-hoc target.
+  ad-hoc target. `host.plan` alone takes a richer **`host_ref: {name, vantage}`**
+  because connect-planning is vantage-relative; every other host-targeting tool uses
+  the bare `host`.
 - **Events drain, they don't filter in place.** Filtering client-side after a drain
   loses non-matching events; use `watch.wait` (subset select) or a server-side
   filter, not drain-then-filter.
@@ -76,7 +78,7 @@ Tier 0 — the *tier of a tool is set by what it must invoke on the remote*):
 |---|---|---|---|
 | `connection.open` | **The sole auth path.** Open/warm a connection (jump hops + auth paid once); persistent ones multiplex. Returns the `connection_id` every other tool references; reuses a matching warm connection when one already exists. | `host`, `addr?`, `user?`, `jump?: [{name,addr,user}]`, `credential_ref?`, `persistent?` | `{connection_id, via, reused, healthy}` |
 | `connection.close` | Close a connection and its channels. | `connection_id` | ok |
-| `connection.list` | List live connections + health. | — | `[{id, host, via, channels, peak_channels, healthy, age}]` |
+| `connection.list` | List live connections + health. | — | `[{connection_id, host, via, channels, peak_channels, healthy, age}]` |
 
 Emits: `connection_down` / `connection_up` (keepalive doubles as liveness probe).
 Jump chains are handshakes over forwarded channels; one warm client multiplexes N
@@ -112,7 +114,8 @@ client-side terminal emulator in **three modes**.
 | Tool | Purpose | Key inputs | Returns |
 |---|---|---|---|
 | `session.open` | Start a persistent PTY session (a channel on the connection). | `connection_id`, `cols?`, `rows?`, `echo?` | `{session_id}` |
-| `session.send` | Send input — command, keystrokes, or signal. | `session_id`, `input` | new output (stream mode) |
+| `session.list` | List live (non-parked) sessions. | `connection_id?` | `[{session_id, mode, cols, rows, age}]` |
+| `session.send` | Send input — command, keystrokes, or signal. | `session_id`, `input` | `{data}` (new output, stream mode; empty in screen mode) |
 | `session.read` | Non-blocking drain since last cursor. | `session_id` | `{data, mode: stream\|screen}` |
 | `session.snapshot` | **Screen mode:** rendered terminal as text + cursor (TUIs). `diff:true` returns only changed rows + `rev`. | `session_id`, `diff?`, `styles?` | `{screen[], cursor_x, cursor_y, cursor_visible, settled_ms, rev, styles?}` |
 | `session.keys` | Named keys for TUI nav — **DECCKM-aware** (arrows switch `ESC[`↔`ESC O` per the app's cursor-key mode). | `session_id`, `keys: [Up\|Down\|Enter\|F5\|Ctrl-C\|…\|"literal"]` | ok |
@@ -164,21 +167,21 @@ Primitives the workflow composes; all Tier 0 (SSH protocol). Three families, nam
 vs `unix` is a property of the endpoint, not a separate tool. `channel.list` /
 `channel.close` govern **every** id-bearing channel in this section (forwards,
 reverse, socks, and `http.serve`'s exposure) — that's the answer to "do these apply
-to all of them?": yes, keyed by `id`.
+to all of them?": yes, keyed by `channel_id`.
 
 | Tool | Purpose | Key inputs | Returns |
 |---|---|---|---|
-| `channel.forward` | Local→remote (`-L`): reach a remote `host:port` **or** Unix socket via a local endpoint. | `connection_id`, `to: {tcp:"host:port"}\|{unix:"/path"}`, `local_bind?` | `{id, bound}` |
-| `channel.reverse` | Remote→local (`-R`): the remote listens (tcp or unix); each inbound becomes an **`accept` event**. | `connection_id`, `remote_bind`, `target?` | `{id, bound}` |
-| `channel.socks` | Local **SOCKS5** proxy dialing dynamically through the remote (`-D`). | `connection_id`, `local_bind?` | `{id, endpoint}` |
-| `channel.list` / `channel.close` | Manage **every** channel above, keyed by `id`. | `id?` | list / ok |
+| `channel.forward` | Local→remote (`-L`): reach a remote `host:port` **or** Unix socket via a local endpoint. | `connection_id`, `to: {tcp:"host:port"}\|{unix:"/path"}`, `local_bind?` | `{channel_id, bound}` |
+| `channel.reverse` | Remote→local (`-R`): the remote listens (tcp or unix); each inbound becomes an **`accept` event**. | `connection_id`, `remote_bind`, `target?` | `{channel_id, bound}` |
+| `channel.socks` | Local **SOCKS5** proxy dialing dynamically through the remote (`-D`). | `connection_id`, `local_bind?` | `{channel_id, endpoint}` |
+| `channel.list` / `channel.close` | Manage **every** channel above, keyed by `channel_id`. | `channel_id?` | list / ok |
 
 **HTTP over the connection (`http.*`)** — not raw tunnels; convenience on top.
 
 | Tool | Purpose | Key inputs | Returns |
 |---|---|---|---|
 | `http.fetch` | HTTP(S) request **dialed through the connection** (or at a forwarded `unix_socket`); structured result. | `connection_id`, `method`, `url`, `headers?`, `body?`, `unix_socket?` | `{status, headers, body\|output_ref}` |
-| `http.serve` | Agent-hosted HTTP endpoint, optionally exposed on the remote via a reverse channel; inbound requests become events. *(Most advanced; built last.)* | `bind`, `expose_on?: connection_id` | `{id, bound}` |
+| `http.serve` | Agent-hosted HTTP endpoint, optionally exposed on the remote via a reverse channel; inbound requests become events. *(Most advanced; built last.)* | `bind`, `expose_on?: connection_id` | `{channel_id, bound}` |
 
 **Agent forwarding (`agent.*`)** — a per-connection capability, *not* a managed
 listener (no `id`); kept out of `channel.*` to avoid the "forward" verb collision.
@@ -195,7 +198,7 @@ Whole-file SFTP is Tier 0; **delta `sync` is Tier 1** (needs remote `rsync`) —
 |---|---|---|---|
 | `transfer.upload` | Send a file (local path **or inline content**) to the remote. | `connection_id`, `remote_path`, `local_path\|content` | `{transfer_id}`; big ⇒ progress events |
 | `transfer.download` | Fetch a remote file (or inline if small). | `connection_id`, `remote_path`, `local_path?` | `{transfer_id}` / content / `output_ref` |
-| `transfer.list` | Active transfers. | — | `[{id, kind, src, dest, bytes_done, bytes_total, done, error?}]` |
+| `transfer.list` | Active transfers. | — | `[{transfer_id, kind, src, dest, bytes_done, bytes_total, done, error?}]` |
 
 Emits `transfer_progress` (rate-limited ~50ms) / `transfer_done` / `transfer_error`.
 
@@ -215,7 +218,7 @@ Validation errors are tagged by side (`input` vs `output`) so the agent knows wh
 to retry corrected input or report server misbehavior; unknown ref/method lists the
 catalog inline.
 
-## Output artifacts
+## Output artifacts — paging & search
 
 | Tool | Purpose | Key inputs | Returns |
 |---|---|---|---|
@@ -230,9 +233,12 @@ catalog inline.
 | `event.wait` | **Blocking** long-poll: next event from any source (or timeout — not an error, re-ask). One outstanding call, zero polling cost. | `timeout?`, `filter?` | `{events:[{seq, source, kind, …}], timed_out, pending_events}` |
 | `event.poll` | **Non-blocking** drain of everything queued. | — | `{events[], pending_events}` |
 
-Every other tool result includes `pending_events: N`. Event `kind`s in use: `match`,
-`output`, `exit`, `accept`, `transfer_progress`, `transfer_done`, `connection_down`,
-`connection_up`, `watch_fired`, `screen_settled`, `silence`.
+Every other tool result includes `pending_events: N`. Tier-0 event `kind`s: `match`,
+`output`, `exit`, `accept`, `transfer_progress`, `transfer_done`, `transfer_error`,
+`connection_down`, `connection_up`, `watch_fired`, `screen_settled`, `silence`,
+`needs_attention`. Tier-1 sections register their own (`service_*`, `cert_rotated`,
+`vhost_*`, `unit_*`, `journal_entry`, `endpoint_*`, `sse_event`, `ws_message`) —
+each is documented where the tool that emits it lives.
 
 ## Watches — autonomous automation
 
@@ -275,7 +281,7 @@ via a `credential_ref`. The secret is resolved server-side; **the grep-invariant
   elicitation round-trips** (the MFA case — `Password:` then `Verification code:`).
 - Headless keystore: kernel keyring + tmpfs work; OS Secret Service does **not**.
 
-## Config
+## Config — live, layered
 
 | Tool | Purpose | Key inputs | Returns |
 |---|---|---|---|
@@ -302,7 +308,7 @@ Needs `tail -F` (coreutils); follows across rotation. Firehose stays server-side
 | Tool | Purpose | Key inputs | Returns |
 |---|---|---|---|
 | `log.follow` | Follow a log, emit **match-with-context** events for named patterns. | `host`, `path`, `patterns: [{name, regex, before?, after?, max_fires?, per_ms?}]` | `{follow_id, output_ref}` |
-| `log.unfollow` / `follow.list` | Stop / list. | `follow_id?` | ok / list |
+| `log.unfollow` / `log.list` | Stop / list. | `follow_id?` | ok / list |
 
 Match event: `{pattern, line, line_no, before[], after[], output_ref, suppressed}`.
 Per-pattern rate limits (one noisy pattern doesn't starve rare ones); quiet-log flush
@@ -335,7 +341,7 @@ note maps this same surface onto launchd/rc.d via shell-out, polling-only, for l
 |---|---|---|---|
 | `systemd.status` | One unit's state. | `connection_id`, `scope: system\|user`, `unit` | `{name, description, load_state, active_state, sub_state, unit_file_state, main_pid?, memory?, tasks?}` |
 | `systemd.list` | Units matching globs. | `connection_id`, `scope`, `patterns?[]` | `{units:[UnitStatus]}` |
-| `systemd.start` / `.stop` / `.restart` / `.reload` / `.enable` / `.disable` | Lifecycle ops. | `connection_id`, `scope`, `unit` | `{ok}` / error |
+| `systemd.start` / `.stop` / `.restart` / `.reload` / `.enable` / `.disable` | Lifecycle ops. | `connection_id`, `scope`, `unit` | ok / error |
 | `systemd.watch` | Emit `unit_started` / `unit_stopped` / `unit_failed` on state change. | `host`, `scope`, `patterns[]` | `{watch_id}` → events |
 | `systemd.journal` | Follow a unit's journal; emit `journal_entry`. | `host`, `scope`, `unit` | `{watch_id}` → events |
 
