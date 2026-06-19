@@ -23,11 +23,13 @@ Arguments are filled in from what the `poc/` phase actually validated.
 Everything rides three layers (all **client-side**, so the layers themselves are
 Tier 0 — the *tier of a tool is set by what it must invoke on the remote*):
 
-1. **Channel multiplexer** — one warm connection per host; every operation is a
-   channel on it. Handshake + jump hops + key-decrypt are paid once and reused.
+1. **Channel multiplexer** — a connection is the **unit of authentication**:
+   `connect` (the *only* auth path) pays the handshake + jump hops + key-decrypt
+   once and returns a `connection_id`. Every later operation is a channel
+   multiplexed on that id; no tool but `connect` ever re-authenticates.
 2. **Event reactor** — every channel and every watch feeds **one unified event
    queue** with a single total-order `seq`. The agent consumes it with
-   `wait_for_event` / `poll_events`; every tool result carries `pending_events: N`.
+   `event.wait` / `event.poll`; every tool result carries `pending_events: N`.
    *(Proven: standard MCP notifications are swallowed by Claude Code — **PULL is the
    authoritative path**; push is an optional accelerator. See Events.)*
 3. **Automation engine** — watches (`predicate → reaction`) run server-side using
@@ -49,9 +51,19 @@ Tier 0 — the *tier of a tool is set by what it must invoke on the remote*):
 - **One admission gate, open by default.** Direct *and* watch-triggered calls pass
   through the same CEL gate with an unspoofable `origin` (`agent` | `watch:<id>`);
   outcomes are `allow` / `deny` / `confirm`, all journaled. Off unless configured.
-- **`host`** is a configured host profile (preferred) or an ad-hoc target.
+- **The connection is the unit of auth; `connection_id` is the referent for direct
+  operations.** Every one-shot tool that moves bytes takes a `connection_id` (or a
+  handle — `session_id`, `output_ref`, `schema_ref`, `repo_ref`, a forward `id` —
+  created against one); it **never re-authenticates**. **`host` (a profile) appears
+  only where the operation is connection-*independent*:** `connect` itself (profile +
+  `credential_ref` → connection), `host.plan` (never connects), and the long-lived
+  **watches/followers** (`watch.create`, `log.follow`, `service.watch`,
+  `endpoint.watch`, `systemd.watch`, `systemd.journal`) — these target a profile so
+  the engine reconnects and they survive disconnection.
+- **`host`** (where it appears) is a configured host profile (preferred) or an
+  ad-hoc target.
 - **Events drain, they don't filter in place.** Filtering client-side after a drain
-  loses non-matching events; use `wait_for_watch` (subset select) or a server-side
+  loses non-matching events; use `watch.wait` (subset select) or a server-side
   filter, not drain-then-filter.
 
 ---
@@ -62,7 +74,7 @@ Tier 0 — the *tier of a tool is set by what it must invoke on the remote*):
 
 | Tool | Purpose | Key inputs | Returns |
 |---|---|---|---|
-| `connect` | Open/warm a connection (jump hops + auth paid once); persistent ones multiplex. Often implicit — naming a host reuses or creates one. | `host`, `addr?`, `user?`, `jump?: [{name,addr,user}]`, `credential_ref?`, `persistent?` | `{connection_id, via, reused, healthy}` |
+| `connect` | **The sole auth path.** Open/warm a connection (jump hops + auth paid once); persistent ones multiplex. Returns the `connection_id` every other tool references; reuses a matching warm connection when one already exists. | `host`, `addr?`, `user?`, `jump?: [{name,addr,user}]`, `credential_ref?`, `persistent?` | `{connection_id, via, reused, healthy}` |
 | `disconnect` | Close a connection and its channels. | `connection_id` | ok |
 | `connections` | List live connections + health. | — | `[{id, host, via, channels, peak_channels, healthy, age}]` |
 
@@ -74,17 +86,19 @@ channels.
 
 | Tool | Purpose | Key inputs | Returns |
 |---|---|---|---|
-| `exec` | Run a single command. `wait:true` blocks (bounded) and returns the result; `wait:false` returns a handle and emits an `exit` event. | `host`, `command`, `wait?`, `timeout?`, `isolation?` *(Tier 1)*, output limits | `{stdout, stderr, exit_code, truncated, output_ref?, duration}` |
+| `exec` | Run a single command. `wait:true` blocks (bounded) and returns the result; `wait:false` returns a handle and emits an `exit` event. | `connection_id`, `command`, `wait?`, `timeout?`, `isolation?` *(Tier 1)*, output limits | `{stdout, stderr, exit_code, truncated, output_ref?, duration}` |
 
 ## Connect-planning & survey (#12)
 
-Read-only; answers "how do I reach X, am I ready, what can it do?" before/while
-acting. Planning needs nothing remote; survey runs read-only shell probes over `exec`.
+Read-only; answers "how do I reach X, am I ready, what can it do?" The two tools sit
+on opposite sides of the connect boundary — which is why they take different referents:
+`host.plan` runs *before* connecting (it never connects → `host_ref`), `survey` runs
+*after* (read-only shell probes over `exec` → a live `connection_id`).
 
 | Tool | Purpose | Key inputs | Returns |
 |---|---|---|---|
 | `host.plan` | Vantage-relative connect plan from federated inventories (ssh_config / known_hosts / cloud fabrics). Names the steps and whether you're ready — without connecting. | `host_ref: {name, vantage}` | `{status: ok\|unreachable\|not_ready, steps:[{kind, target?, readiness_blocker?}], auth:{type,user?,key_ref?,cert_ref?}, readiness:{verdict, remedy?}}` |
-| `survey` | Run the fixed, read-only capability allowlist (OS, arch, which COTS is present → which Tier-1 tools this host supports). Cached with TTL + invalidate. | `host`, `facts?: [name]`, `refresh?` | `{facts: {name: value}, cached, age}` |
+| `survey` | Run the fixed, read-only capability allowlist (OS, arch, which COTS is present → which Tier-1 tools this host supports). Cached with TTL + invalidate. | `connection_id`, `facts?: [name]`, `refresh?` | `{facts: {name: value}, cached, age}` |
 
 Step `kind`s: `join-fabric` / `jump` / `connect` / `survey` (mild, auto-run) vs
 `enrol` / `mint` (hot — gated, returns a consent request). Survey is **safe by
@@ -97,7 +111,7 @@ client-side terminal emulator in **three modes**.
 
 | Tool | Purpose | Key inputs | Returns |
 |---|---|---|---|
-| `session.open` | Start a persistent PTY session. | `host`, `cols?`, `rows?`, `echo?` | `{session_id}` |
+| `session.open` | Start a persistent PTY session (a channel on the connection). | `connection_id`, `cols?`, `rows?`, `echo?` | `{session_id}` |
 | `session.send` | Send input — command, keystrokes, or signal. | `session_id`, `input` | new output (stream mode) |
 | `session.read` | Non-blocking drain since last cursor. | `session_id` | `{data, mode: stream\|screen}` |
 | `session.snapshot` | **Screen mode:** rendered terminal as text + cursor (TUIs). `diff:true` returns only changed rows + `rev`. | `session_id`, `diff?`, `styles?` | `{screen[], cursor_x, cursor_y, cursor_visible, settled_ms, rev, styles?}` |
@@ -113,12 +127,14 @@ request is not). Emits: `output`, `screen_settled`, `exit`.
 
 ## Expect — scripted interactive (#17)
 
-One streamed-pattern engine, two stances; both are Tier 0 (PTY only).
+One streamed-pattern engine, two stances; both are Tier 0 (PTY only), so both live
+in the `session.*` namespace. `session.expect` drives a *transient* PTY on a
+`connection_id` (open-drive-close); `session.match` attaches to an *existing* session.
 
 | Tool | Purpose | Key inputs | Returns |
 |---|---|---|---|
-| `expect.run` | **DRIVE** a conversation: alternating expect/send steps with per-step timeouts; captures regex groups. | `host`, `steps: [{expect: regex, send, timeout?}]`, `timeout?` | `{ok, error?, steps:[{expect, match[], output}]}` |
-| `console.match` | **TRIGGER:** watch a held-open TTY for N named patterns; returns which fired + captures. Session-scoped (owns the live PTY); supports a `prime` for consoles that won't speak until poked. | `session_id\|host`, `patterns: [{name, regex}]`, `prime?`, `timeout?` | `{matched, name?, capture[], buffer, timed_out}` |
+| `session.expect` | **DRIVE** a conversation on a transient PTY: alternating expect/send steps with per-step timeouts; captures regex groups. | `connection_id`, `steps: [{expect: regex, send, timeout?}]`, `timeout?` | `{ok, error?, steps:[{expect, match[], output}]}` |
+| `session.match` | **TRIGGER:** watch a held-open session's TTY for N named patterns; returns which fired + captures. Owns the live PTY; supports a `prime` for consoles that won't speak until poked. | `session_id`, `patterns: [{name, regex}]`, `prime?`, `timeout?` | `{matched, name?, capture[], buffer, timed_out}` |
 
 For DRIVE a timeout is failure (`ok:false`); for TRIGGER it's "not yet"
 (`matched:false, timed_out:true`, no error).
@@ -131,29 +147,34 @@ sibling + posix-rename), auto-falling back to in-place writes on virtual filesys
 
 | Tool | Purpose | Key inputs | Returns |
 |---|---|---|---|
-| `file.read` | Read a remote file (or range). | `host`, `path`, `max_bytes?` | `{content, truncated, output_ref?}` |
-| `file.edit` | Structured edits: `str_replace` (unique, or `all:true`), `append`, `prepend`, line insert/delete/replace, regex replace, or apply a unified diff. `dry_run` returns the would-be content. | `host`, `path`, `edits:[{op, …}]`, `dry_run?`, `backup?` | `{applied, new_content?, atomic, reason?}` |
-| `file.write` | Create/overwrite a file. | `host`, `path`, `content`, `mode?`, `backup?` | `{atomic, bytes, reason?}` |
-| `file.stat` | Existence / size / mode / mtime / kind. | `host`, `path` | `{exists, size?, mode?, kind?, mtime?}` |
-| `file.list` / `file.mkdir` / `file.rename` / `file.remove` / `file.chmod` | SFTP basics (`rename` is atomic posix-rename). | `host`, `path` (+ `to`, `mode`) | ok / entries |
+| `file.read` | Read a remote file (or range). | `connection_id`, `path`, `max_bytes?` | `{content, truncated, output_ref?}` |
+| `file.edit` | Structured edits: `str_replace` (unique, or `all:true`), `append`, `prepend`, line insert/delete/replace, regex replace, or apply a unified diff. `dry_run` returns the would-be content. | `connection_id`, `path`, `edits:[{op, …}]`, `dry_run?`, `backup?` | `{applied, new_content?, atomic, reason?}` |
+| `file.write` | Create/overwrite a file. | `connection_id`, `path`, `content`, `mode?`, `backup?` | `{atomic, bytes, reason?}` |
+| `file.stat` | Existence / size / mode / mtime / kind. | `connection_id`, `path` | `{exists, size?, mode?, kind?, mtime?}` |
+| `file.list` / `file.mkdir` / `file.rename` / `file.remove` / `file.chmod` | SFTP basics (`rename` is atomic posix-rename). | `connection_id`, `path` (+ `to`, `mode`) | ok / entries |
 
 `str_replace` on a non-unique match errors unless `all:true`.
 
 ## Channels & forwarding — general-purpose plumbing (#3, #6, #7)
 
 Primitives, not prescriptive — the workflow composes them. All Tier 0 (SSH protocol).
+Every creator below is a channel on a `connection_id` and returns an `id`;
+`forward.list` / `forward.close` manage **any** of them uniformly (tcp, unix, reverse,
+socks, `http.serve` listeners), keyed by that `id` — they are not scoped to `forward.*`.
+*(`agent.forward` is the odd one out: it isn't a managed listener but a per-connection
+capability — exposing the local SSH agent to the remote — so it has no `id`.)*
 
 | Tool | Purpose | Key inputs | Returns |
 |---|---|---|---|
-| `forward.tcp` | Reach a remote-visible `host:port` via a local endpoint (`-L`). | `host`, `remote_addr`, `local_bind?` | `{id, bound}` |
-| `forward.unix` | Reach a **remote Unix socket** (docker.sock, a DB socket) via a local endpoint. | `host`, `remote_socket`, `local_bind?` | `{id, bound}` |
-| `reverse.tcp` | Remote listens; each inbound connection becomes an **`accept` event** (`-R`). | `host`, `remote_bind`, `target?` | `{id, bound}` |
-| `reverse.unix` | As above for a remote Unix socket. | `host`, `remote_socket`, `target?` | `{id, bound}` |
-| `proxy.socks` | Local **SOCKS5** proxy dialing dynamically through the remote (`-D`). | `host`, `local_bind?` | `{id, endpoint}` |
-| `http.fetch` | HTTP(S) request **dialed through the connection** (or at a forwarded `unix_socket`); structured result. | `host`, `method`, `url`, `headers?`, `body?`, `unix_socket?` | `{status, headers, body\|output_ref}` |
-| `agent.forward` | Expose the local SSH agent to the remote session (needed for cert-gated flows). | `host`, `socket?` | `{forwarded}` |
-| `http.serve` | Agent-hosted HTTP endpoint, optionally exposed on the remote via a reverse channel; inbound requests become events. *(Most advanced; built last.)* | `bind`, `expose_on?` | `{id, bound}` |
-| `forward.list` / `forward.close` | Manage active forwards/listeners/proxies. | `id?` | list / ok |
+| `forward.tcp` | Reach a remote-visible `host:port` via a local endpoint (`-L`). | `connection_id`, `remote_addr`, `local_bind?` | `{id, bound}` |
+| `forward.unix` | Reach a **remote Unix socket** (docker.sock, a DB socket) via a local endpoint. | `connection_id`, `remote_socket`, `local_bind?` | `{id, bound}` |
+| `reverse.tcp` | Remote listens; each inbound connection becomes an **`accept` event** (`-R`). | `connection_id`, `remote_bind`, `target?` | `{id, bound}` |
+| `reverse.unix` | As above for a remote Unix socket. | `connection_id`, `remote_socket`, `target?` | `{id, bound}` |
+| `proxy.socks` | Local **SOCKS5** proxy dialing dynamically through the remote (`-D`). | `connection_id`, `local_bind?` | `{id, endpoint}` |
+| `http.fetch` | HTTP(S) request **dialed through the connection** (or at a forwarded `unix_socket`); structured result. | `connection_id`, `method`, `url`, `headers?`, `body?`, `unix_socket?` | `{status, headers, body\|output_ref}` |
+| `agent.forward` | Expose the local SSH agent to the remote session (needed for cert-gated flows). | `connection_id`, `socket?` | `{forwarded}` |
+| `http.serve` | Agent-hosted HTTP endpoint, optionally exposed on the remote via a reverse channel; inbound requests become events. *(Most advanced; built last.)* | `bind`, `expose_on?: connection_id` | `{id, bound}` |
+| `forward.list` / `forward.close` | Manage **all** active forwards/listeners/proxies (any creator above). | `id?` | list / ok |
 
 ## Transfer — whole-file (#1)
 
@@ -161,8 +182,8 @@ Whole-file SFTP is Tier 0; **delta `sync` is Tier 1** (needs remote `rsync`) —
 
 | Tool | Purpose | Key inputs | Returns |
 |---|---|---|---|
-| `transfer.upload` | Send a file (local path **or inline content**) to the remote. | `host`, `remote_path`, `local_path\|content` | `{transfer_id}`; big ⇒ progress events |
-| `transfer.download` | Fetch a remote file (or inline if small). | `host`, `remote_path`, `local_path?` | `{transfer_id}` / content / `output_ref` |
+| `transfer.upload` | Send a file (local path **or inline content**) to the remote. | `connection_id`, `remote_path`, `local_path\|content` | `{transfer_id}`; big ⇒ progress events |
+| `transfer.download` | Fetch a remote file (or inline if small). | `connection_id`, `remote_path`, `local_path?` | `{transfer_id}` / content / `output_ref` |
 | `transfer.list` | Active transfers. | — | `[{id, kind, src, dest, bytes_done, bytes_total, done, error?}]` |
 
 Emits `transfer_progress` (rate-limited ~50ms) / `transfer_done` / `transfer_error`.
@@ -170,7 +191,9 @@ Emits `transfer_progress` (rate-limited ~50ms) / `transfer_done` / `transfer_err
 ## RPC — typed remote service without its schema (#18)
 
 The agent gets an opaque `schema_ref`; the server holds the JSON Schema, wire client,
-and **auth** (bearer tokens never reach the agent). Dialed through the connection.
+and **auth** (bearer tokens never reach the agent). The `schema_ref` is **registered
+against a `connection_id`** and dials through it, so the agent never re-specifies host
+or auth at call time — the ref *is* the connection-bound handle.
 
 | Tool | Purpose | Key inputs | Returns |
 |---|---|---|---|
@@ -193,8 +216,8 @@ catalog inline.
 
 | Tool | Purpose | Key inputs | Returns |
 |---|---|---|---|
-| `wait_for_event` | **Blocking** long-poll: next event from any source (or timeout — not an error, re-ask). One outstanding call, zero polling cost. | `timeout?`, `filter?` | `{events:[{seq, source, kind, …}], timed_out, pending_events}` |
-| `poll_events` | **Non-blocking** drain of everything queued. | — | `{events[], pending_events}` |
+| `event.wait` | **Blocking** long-poll: next event from any source (or timeout — not an error, re-ask). One outstanding call, zero polling cost. | `timeout?`, `filter?` | `{events:[{seq, source, kind, …}], timed_out, pending_events}` |
+| `event.poll` | **Non-blocking** drain of everything queued. | — | `{events[], pending_events}` |
 
 Every other tool result includes `pending_events: N`. Event `kind`s in use: `match`,
 `output`, `exit`, `accept`, `transfer_progress`, `transfer_done`, `connection_down`,
@@ -210,8 +233,8 @@ DSL. The engine is Tier 0; individual predicates may pull in Tier 1 (`log_match`
 |---|---|---|---|
 | `watch.create` | Register `predicate → reaction`. Notify-only = empty reaction. | `host`, `predicate`, `reaction?: [step]`, `trigger: edge\|level`, `fire: once\|recurring`, `bounds?`, `timeout?` | `{watch_id}` |
 | `watch.list` / `watch.get` / `watch.cancel` | Inspect / cancel; cancel kills any in-flight reaction. | `watch_id?` | list / detail / ok |
-| `wait_for_watch` | **SELECT:** block on a *subset* of watches, naming which fired (clears only those). | `watch_ids?`, `timeout?` | `{firings:[{watch_id, target, state}], pending_watches}` |
-| `journal` | What did my watches/reactions do (esp. while away)? | `since?` | `[{watch_fired\|reaction_started\|reaction_step\|reaction_done\|needs_attention, …}]` |
+| `watch.wait` | **SELECT:** block on a *subset* of watches, naming which fired (clears only those). | `watch_ids?`, `timeout?` | `{firings:[{watch_id, target, state}], pending_watches}` |
+| `watch.journal` | What did my watches/reactions do (esp. while away)? | `since?` | `[{watch_fired\|reaction_started\|reaction_step\|reaction_done\|needs_attention, …}]` |
 
 - **Predicates:** `reachable`, `port_open`, `ssh_auth_ok`, `file_exists`,
   `mtime_changed`, `value_threshold`, `exec(command, check: ==\|matches\|exit_code)`,
@@ -256,7 +279,7 @@ via a `credential_ref`. The secret is resolved server-side; **the grep-invariant
 
 | Tool | Purpose | Key inputs | Returns |
 |---|---|---|---|
-| `transfer.sync` | **rsync-grade** directory mirror over the warm SSH connection (pure-Go gokrazy/rsync client). Needs remote `rsync` (execs `rsync --server`). | `host`, `local`, `remote`, `direction: push\|pull`, `delete?`, `dry_run?`, `include?[]`, `exclude?[]` | `{ok, direction, dry_run, bytes_written?, files_size?, stderr?}` |
+| `transfer.sync` | **rsync-grade** directory mirror over the warm SSH connection (pure-Go gokrazy/rsync client). Needs remote `rsync` (execs `rsync --server`). | `connection_id`, `local`, `remote`, `direction: push\|pull`, `delete?`, `dry_run?`, `include?[]`, `exclude?[]` | `{ok, direction, dry_run, bytes_written?, files_size?, stderr?}` |
 
 Filters are wildcard patterns (no leading `-`). When the box has no `rsync`, see Tier 2.
 
@@ -281,7 +304,7 @@ fingerprints client-side. Transitions surface as reactor events.
 
 | Tool | Purpose | Key inputs | Returns |
 |---|---|---|---|
-| `http.detect` | Inventory listening HTTP(S) services + fingerprint (TLS leaf SHA256, SAN vhosts, HTTP version, framework/WS/SSE, health/openapi), with PID/cwd attribution. | `host`, `depth: minimal\|standard\|aggressive`, `vhost_hints?[]` | `{services:[{port, pid?, process?, cwd?, tls?, vhosts[], http_version, frameworks[], health?, openapi?}]}` |
+| `http.detect` | Inventory listening HTTP(S) services + fingerprint (TLS leaf SHA256, SAN vhosts, HTTP version, framework/WS/SSE, health/openapi), with PID/cwd attribution. | `connection_id`, `depth: minimal\|standard\|aggressive`, `vhost_hints?[]` | `{services:[{port, pid?, process?, cwd?, tls?, vhosts[], http_version, frameworks[], health?, openapi?}]}` |
 | `service.watch` | Watch the listening-socket inventory; emit transitions. | `host`, `poll_interval?`, `expiry_threshold?` | `{watch_id}` → events |
 | `endpoint.watch` | Watch one HTTP endpoint in `poll` (drift + edge-health), `sse`, or `ws` mode. | `host`, `url`, `mode: poll\|sse\|ws`, `interval?`, `redact_keys?[]`, `unhealthy_after?` | `{watch_id}` → events |
 
@@ -299,9 +322,9 @@ note maps this same surface onto launchd/rc.d via shell-out, polling-only, for l
 
 | Tool | Purpose | Key inputs | Returns |
 |---|---|---|---|
-| `systemd.status` | One unit's state. | `host`, `scope: system\|user`, `unit` | `{name, description, load_state, active_state, sub_state, unit_file_state, main_pid?, memory?, tasks?}` |
-| `systemd.list` | Units matching globs. | `host`, `scope`, `patterns?[]` | `{units:[UnitStatus]}` |
-| `systemd.start` / `.stop` / `.restart` / `.reload` / `.enable` / `.disable` | Lifecycle ops. | `host`, `scope`, `unit` | `{ok}` / error |
+| `systemd.status` | One unit's state. | `connection_id`, `scope: system\|user`, `unit` | `{name, description, load_state, active_state, sub_state, unit_file_state, main_pid?, memory?, tasks?}` |
+| `systemd.list` | Units matching globs. | `connection_id`, `scope`, `patterns?[]` | `{units:[UnitStatus]}` |
+| `systemd.start` / `.stop` / `.restart` / `.reload` / `.enable` / `.disable` | Lifecycle ops. | `connection_id`, `scope`, `unit` | `{ok}` / error |
 | `systemd.watch` | Emit `unit_started` / `unit_stopped` / `unit_failed` on state change. | `host`, `scope`, `patterns[]` | `{watch_id}` → events |
 | `systemd.journal` | Follow a unit's journal; emit `journal_entry`. | `host`, `scope`, `unit` | `{watch_id}` → events |
 
@@ -321,7 +344,8 @@ push not yet wired.)*
 | `git.create_branch` / `git.checkout` / `git.add` / `git.commit` | Mutations (each is one explicit intent — no auto-stash, no auto-checkout). | `repo_ref` (+ `name`, `start_point`, `branch`, `paths?`, `subject`, `body?`) | typed result |
 
 `status.clean` and the subject/body split are precomputed server-side; status codes
-are stable enum strings. `repo_ref` is registered; an unknown ref lists the known ones.
+are stable enum strings. `repo_ref` is **registered against a `connection_id`** (the
+connection-bound handle, like `schema_ref`); an unknown ref lists the known ones.
 
 ## Park & resume interactive work (#19)
 
@@ -349,9 +373,9 @@ Needs `sudo` / `setpriv` / `runuser` (or `bwrap` / `firejail` / `systemd-run` /
 
 | Tool | Purpose | Key inputs | Returns |
 |---|---|---|---|
-| `isolation.probe` | Which mechanisms exist on the host. | `host` | `{available: {setpriv, sudo, bwrap, …}}` |
-| `isolation.verify` | Confirm a spec actually drops (uid/gid, no_new_privs, CapEff). | `host`, `isolation` | `{uid, gid, no_new_privs, cap_eff}` |
-| `isolation.set` | Set a repeatable default spec for a host. | `host`, `isolation` | ok |
+| `isolation.probe` | Which mechanisms exist on the host. | `connection_id` | `{available: {setpriv, sudo, bwrap, …}}` |
+| `isolation.verify` | Confirm a spec actually drops (uid/gid, no_new_privs, CapEff). | `connection_id`, `isolation` | `{uid, gid, no_new_privs, cap_eff}` |
+| `isolation.set` | Set a repeatable default spec for a host *profile* (connection-independent config). | `host`, `isolation` | ok |
 
 **Honest limit:** per-exec wrap is not a cage if the agent is root. Real confinement
 needs (1) dropping once at login into an unprivileged session and (2) the guardrails
