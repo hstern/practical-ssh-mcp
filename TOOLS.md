@@ -266,6 +266,11 @@ DSL. The engine is Tier 0; individual predicates may pull in Tier 1 (`log_match`
 - **`trigger`:** `level` fires at creation if already true; `edge` only on transition.
 - Explicit watches **survive disconnection** — they target a host profile, not a live
   channel ("tell me when the host is back up" works through a reboot).
+- **One registry.** Every long-lived emitter is a watch with a `watch_id`, whether
+  created by `watch.create` or by a specialized creator in another family
+  (`log.follow`, `service.watch`, `endpoint.watch`, `systemd.watch`,
+  `systemd.journal`). All are inspected/cancelled/awaited through `watch.*` — the
+  specialized tools are just typed front-ends onto the same registry.
 
 ## Credentials & auth (cross-cutting; A)
 
@@ -303,12 +308,13 @@ Filters are wildcard patterns (no leading `-`). When the box has no `rsync`, see
 ## Rolling logs (#9)
 
 Needs `tail -F` (coreutils); follows across rotation. Firehose stays server-side as an
-`output_ref`; only matches (with context, rate-limited) enter the event queue.
+`output_ref`; only matches (with context, rate-limited) enter the event queue. A
+follow **is a watch** — it returns a `watch_id` and is managed by `watch.*`
+(`watch.list` / `watch.cancel` / `watch.wait`); there is no separate `log.unfollow`.
 
 | Tool | Purpose | Key inputs | Returns |
 |---|---|---|---|
-| `log.follow` | Follow a log, emit **match-with-context** events for named patterns. | `host`, `path`, `patterns: [{name, regex, before?, after?, max_fires?, per_ms?}]` | `{follow_id, output_ref}` |
-| `log.unfollow` / `log.list` | Stop / list. | `follow_id?` | ok / list |
+| `log.follow` | Follow a log, emit **match-with-context** events for named patterns. | `host`, `path`, `patterns: [{name, regex, before?, after?, max_fires?, per_ms?}]` | `{watch_id, output_ref}` |
 
 Match event: `{pattern, line, line_no, before[], after[], output_ref, suppressed}`.
 Per-pattern rate limits (one noisy pattern doesn't starve rare ones); quiet-log flush
