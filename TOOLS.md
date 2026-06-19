@@ -155,26 +155,37 @@ sibling + posix-rename), auto-falling back to in-place writes on virtual filesys
 
 `str_replace` on a non-unique match errors unless `all:true`.
 
-## Channels & forwarding — general-purpose plumbing (#3, #6, #7)
+## Channels — forwarding, HTTP, agent (#3, #6, #7)
 
-Primitives, not prescriptive — the workflow composes them. All Tier 0 (SSH protocol).
-Every creator below is a channel on a `connection_id` and returns an `id`;
-`forward.list` / `forward.close` manage **any** of them uniformly (tcp, unix, reverse,
-socks, `http.serve` listeners), keyed by that `id` — they are not scoped to `forward.*`.
-*(`agent.forward` is the odd one out: it isn't a managed listener but a per-connection
-capability — exposing the local SSH agent to the remote — so it has no `id`.)*
+Primitives the workflow composes; all Tier 0 (SSH protocol). Three families, named by
+*what they are* rather than crammed under one prefix.
+
+**Forwarding channels (`channel.*`)** — managed tunnels on a `connection_id`. `tcp`
+vs `unix` is a property of the endpoint, not a separate tool. `channel.list` /
+`channel.close` govern **every** id-bearing channel in this section (forwards,
+reverse, socks, and `http.serve`'s exposure) — that's the answer to "do these apply
+to all of them?": yes, keyed by `id`.
 
 | Tool | Purpose | Key inputs | Returns |
 |---|---|---|---|
-| `forward.tcp` | Reach a remote-visible `host:port` via a local endpoint (`-L`). | `connection_id`, `remote_addr`, `local_bind?` | `{id, bound}` |
-| `forward.unix` | Reach a **remote Unix socket** (docker.sock, a DB socket) via a local endpoint. | `connection_id`, `remote_socket`, `local_bind?` | `{id, bound}` |
-| `reverse.tcp` | Remote listens; each inbound connection becomes an **`accept` event** (`-R`). | `connection_id`, `remote_bind`, `target?` | `{id, bound}` |
-| `reverse.unix` | As above for a remote Unix socket. | `connection_id`, `remote_socket`, `target?` | `{id, bound}` |
-| `proxy.socks` | Local **SOCKS5** proxy dialing dynamically through the remote (`-D`). | `connection_id`, `local_bind?` | `{id, endpoint}` |
+| `channel.forward` | Local→remote (`-L`): reach a remote `host:port` **or** Unix socket via a local endpoint. | `connection_id`, `to: {tcp:"host:port"}\|{unix:"/path"}`, `local_bind?` | `{id, bound}` |
+| `channel.reverse` | Remote→local (`-R`): the remote listens (tcp or unix); each inbound becomes an **`accept` event**. | `connection_id`, `remote_bind`, `target?` | `{id, bound}` |
+| `channel.socks` | Local **SOCKS5** proxy dialing dynamically through the remote (`-D`). | `connection_id`, `local_bind?` | `{id, endpoint}` |
+| `channel.list` / `channel.close` | Manage **every** channel above, keyed by `id`. | `id?` | list / ok |
+
+**HTTP over the connection (`http.*`)** — not raw tunnels; convenience on top.
+
+| Tool | Purpose | Key inputs | Returns |
+|---|---|---|---|
 | `http.fetch` | HTTP(S) request **dialed through the connection** (or at a forwarded `unix_socket`); structured result. | `connection_id`, `method`, `url`, `headers?`, `body?`, `unix_socket?` | `{status, headers, body\|output_ref}` |
-| `agent.forward` | Expose the local SSH agent to the remote session (needed for cert-gated flows). | `connection_id`, `socket?` | `{forwarded}` |
 | `http.serve` | Agent-hosted HTTP endpoint, optionally exposed on the remote via a reverse channel; inbound requests become events. *(Most advanced; built last.)* | `bind`, `expose_on?: connection_id` | `{id, bound}` |
-| `forward.list` / `forward.close` | Manage **all** active forwards/listeners/proxies (any creator above). | `id?` | list / ok |
+
+**Agent forwarding (`agent.*`)** — a per-connection capability, *not* a managed
+listener (no `id`); kept out of `channel.*` to avoid the "forward" verb collision.
+
+| Tool | Purpose | Key inputs | Returns |
+|---|---|---|---|
+| `agent.forward` | Expose the local SSH agent to the remote (needed for cert-gated flows). | `connection_id`, `socket?` | `{forwarded}` |
 
 ## Transfer — whole-file (#1)
 
