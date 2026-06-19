@@ -24,9 +24,9 @@ Everything rides three layers (all **client-side**, so the layers themselves are
 Tier 0 — the *tier of a tool is set by what it must invoke on the remote*):
 
 1. **Channel multiplexer** — a connection is the **unit of authentication**:
-   `connect` (the *only* auth path) pays the handshake + jump hops + key-decrypt
-   once and returns a `connection_id`. Every later operation is a channel
-   multiplexed on that id; no tool but `connect` ever re-authenticates.
+   `connection.open` (the *only* auth path) pays the handshake + jump hops +
+   key-decrypt once and returns a `connection_id`. Every later operation is a
+   channel multiplexed on that id; no tool but `connection.open` re-authenticates.
 2. **Event reactor** — every channel and every watch feeds **one unified event
    queue** with a single total-order `seq`. The agent consumes it with
    `event.wait` / `event.poll`; every tool result carries `pending_events: N`.
@@ -55,7 +55,7 @@ Tier 0 — the *tier of a tool is set by what it must invoke on the remote*):
   operations.** Every one-shot tool that moves bytes takes a `connection_id` (or a
   handle — `session_id`, `output_ref`, `schema_ref`, `repo_ref`, a forward `id` —
   created against one); it **never re-authenticates**. **`host` (a profile) appears
-  only where the operation is connection-*independent*:** `connect` itself (profile +
+  only where the operation is connection-*independent*:** `connection.open` itself (profile +
   `credential_ref` → connection), `host.plan` (never connects), and the long-lived
   **watches/followers** (`watch.create`, `log.follow`, `service.watch`,
   `endpoint.watch`, `systemd.watch`, `systemd.journal`) — these target a profile so
@@ -74,9 +74,9 @@ Tier 0 — the *tier of a tool is set by what it must invoke on the remote*):
 
 | Tool | Purpose | Key inputs | Returns |
 |---|---|---|---|
-| `connect` | **The sole auth path.** Open/warm a connection (jump hops + auth paid once); persistent ones multiplex. Returns the `connection_id` every other tool references; reuses a matching warm connection when one already exists. | `host`, `addr?`, `user?`, `jump?: [{name,addr,user}]`, `credential_ref?`, `persistent?` | `{connection_id, via, reused, healthy}` |
-| `disconnect` | Close a connection and its channels. | `connection_id` | ok |
-| `connections` | List live connections + health. | — | `[{id, host, via, channels, peak_channels, healthy, age}]` |
+| `connection.open` | **The sole auth path.** Open/warm a connection (jump hops + auth paid once); persistent ones multiplex. Returns the `connection_id` every other tool references; reuses a matching warm connection when one already exists. | `host`, `addr?`, `user?`, `jump?: [{name,addr,user}]`, `credential_ref?`, `persistent?` | `{connection_id, via, reused, healthy}` |
+| `connection.close` | Close a connection and its channels. | `connection_id` | ok |
+| `connection.list` | List live connections + health. | — | `[{id, host, via, channels, peak_channels, healthy, age}]` |
 
 Emits: `connection_down` / `connection_up` (keepalive doubles as liveness probe).
 Jump chains are handshakes over forwarded channels; one warm client multiplexes N
@@ -252,14 +252,14 @@ DSL. The engine is Tier 0; individual predicates may pull in Tier 1 (`log_match`
 
 ## Credentials & auth (cross-cutting; A)
 
-No standalone credential tool — auth rides `connect` and any tool needing a secret,
+No standalone credential tool — auth rides `connection.open` and any tool needing a secret,
 via a `credential_ref`. The secret is resolved server-side; **the grep-invariant holds
 (no secret in the transcript)**.
 
 - **`credential_ref: {kind, name, params?}`**, `kind` ∈ `stored` (static),
   `fetch` (exec `vault`/`op`/`pass`/`step` at use), `mint` (external CA or in-process
   CA → short-lived cert), `generate` (TOTP/HOTP/derived).
-- **Auth shape on `connect`:** one-shot for `password` / `publickey` / `certificate` /
+- **Auth shape on `connection.open`:** one-shot for `password` / `publickey` / `certificate` /
   `agent` / `gssapi` / `hostbased`; **`keyboard-interactive` fans one call into N
   elicitation round-trips** (the MFA case — `Password:` then `Verification code:`).
 - Headless keystore: kernel keyring + tmpfs work; OS Secret Service does **not**.
@@ -397,4 +397,4 @@ decision, not a committed feature.
 |---|---|---|
 | **Delta-sync without `rsync`** (variant of #8) | The block-delta rolling checksum must run on the remote; with no `rsync`, the helper is the server side. | `transfer.sync` transparently uses the helper when `survey` reports no `rsync`. |
 | **Low-latency push & disconnection-surviving autonomy** (variant of #5/#9/#14) | inotify / journal / `/proc` transitions pushed without client polling; watches that keep running after the MCP server disconnects. | A resident agent feeding the reactor; conflicts with the no-daemon scope. |
-| **Cert-gated privilege escalation** (B) | Root for a specific task via a short-lived, principal-scoped cert verified by a cert-aware PAM module — not standing `sudo`. | `connect`/escalate with `credential_ref{kind:mint}` + `agent.forward`; needs `pam_ussh` (a **C** module — the Go `c-shared` build is inert under setuid `sudo`) and explicit CA-trust verification (x/crypto's `CheckCert` does **not** check `IsUserAuthority`). |
+| **Cert-gated privilege escalation** (B) | Root for a specific task via a short-lived, principal-scoped cert verified by a cert-aware PAM module — not standing `sudo`. | `connection.open`/escalate with `credential_ref{kind:mint}` + `agent.forward`; needs `pam_ussh` (a **C** module — the Go `c-shared` build is inert under setuid `sudo`) and explicit CA-trust verification (x/crypto's `CheckCert` does **not** check `IsUserAuthority`). |
